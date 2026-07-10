@@ -559,8 +559,10 @@ if l2_file and ann_file and master_file:
                 cols = {
                     "_coil_no_display": "Coil No.", "Customer": "Customer", "Alloy": "Alloy",
                     "Temper": "Temper", "Exit_mm": "Reached Th. (mm)",
-                    target_col: "Final Targeted Th. (mm)", "Designated_Temp": "Temp",
+                    target_col: "Final Targeted Th. (mm)",
                 }
+                if "Designated_Temp" in df.columns:
+                    cols["Designated_Temp"] = "Temp"
                 return df[list(cols.keys())].rename(columns=cols)
 
             st.divider()
@@ -583,7 +585,7 @@ if l2_file and ann_file and master_file:
                 st.info("No coils are missing a temperature right now.")
             else:
                 st.warning(f"{len(final_no_temp_df)} coil(s) need a temperature assigned")
-                st.dataframe(show_table(final_no_temp_df).drop(columns=["Temp"]), use_container_width=True)
+                st.dataframe(show_table(final_no_temp_df), use_container_width=True)
 
             st.divider()
             excel_buf = build_classification_workbook(int_ann_df, final_with_temp_df, final_no_temp_df)
