@@ -145,19 +145,149 @@ def load_ann_target_sheet(uploaded_file):
     )
 
 
+def find_header_row(ws, must_contain=("COIL Man", "Targeted Th")):
+    """Scan the first 10 rows of an openpyxl worksheet for the header row."""
+    for r in range(1, 11):
+        values = [str(c.value) for c in ws[r] if c.value is not None]
+        joined = " | ".join(values)
+        if all(any(token.lower() in v.lower() for v in values) for token in must_contain):
+            return r
+    return None
+
+
+def load_master_plan(uploaded_file):
+    """Load the big Cold Rolling Schedule / Plan master file.
+    Returns a per-coil dataframe (last known pass per coil) with Targeted Th.,
+    Process, Next, and identifying info. Unlike the small Ann list, this file
+    normally has NO temperature column - it's used as the authoritative
+    source for target thickness + process routing.
+    """
+    data = uploaded_file.read()
+    uploaded_file.seek(0)
+    wb = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+
+    candidates = []
+    for sn in wb.sheetnames:
+        ws = wb[sn]
+        hr = find_header_row(ws)
+        if hr:
+            candidates.append((sn, hr))
+
+    if not candidates:
+        raise ValueError(
+            "Couldn't find a sheet in the master plan with 'COIL Man #' and "
+            "'Targeted Th.' columns."
+        )
+
+    # Prefer a sheet literally named like "CRM" (the active cold-mill plan)
+    # over broader/historical sheets (e.g. "Rolling Production Plan").
+    crm_candidates = [c for c in candidates if "crm" in c[0].lower()]
+    best_sheet, best_header_row = (crm_candidates or candidates)[0]
+
+    wb.close()
+    df = pd.read_excel(io.BytesIO(data), sheet_name=best_sheet, header=best_header_row - 1, engine="openpyxl")
+    df.columns = [str(c).strip() for c in df.columns]
+
+    col_coil = find_col(df.columns, "COIL Man")
+    col_th = find_col(df.columns, "TH [mm]") or find_col(df.columns, "TH")
+    col_target = find_col(df.columns, "Targeted Th")
+    col_pass = find_col(df.columns, "PASS")
+    col_process = find_col(df.columns, "Process")
+    col_next = find_col(df.columns, "NEXT")
+    col_customer = find_col(df.columns, "Customer")
+    col_alloy = find_col(df.columns, "A") if "A" in df.columns else find_col(df.columns, "Alloy")
+    col_temper = find_col(df.columns, "T.T")
+    col_width = find_col(df.columns, "Width")
+    col_tw = find_col(df.columns, "T.W")
+    col_od = find_col(df.columns, "OD")
+    col_weight = find_col(df.columns, "Weight")
+
+    df = df.dropna(subset=[col_coil]).copy()
+    df["_coil_key"] = df[col_coil].apply(normalize_coil)
+
+    def pass_num(v):
+        if pd.isna(v):
+            return -1
+        m = re.search(r"\d+", str(v))
+        return int(m.group()) if m else -1
+
+    df["_pass_num"] = df[col_pass].apply(pass_num) if col_pass else 0
+    df_sorted = df.sort_values("_pass_num")
+    last_rows = df_sorted.groupby("_coil_key", as_index=False).tail(1)
+
+    out = pd.DataFrame({
+        "_coil_key": last_rows["_coil_key"],
+        "Customer": last_rows[col_customer] if col_customer else None,
+        "Alloy": last_rows[col_alloy] if col_alloy else None,
+        "Temper": last_rows[col_temper] if col_temper else None,
+        "TH_mm_master": last_rows[col_th] if col_th else None,
+        "Targeted_Th_mm_master": last_rows[col_target],
+        "Width": last_rows[col_width] if col_width else None,
+        "TW": last_rows[col_tw] if col_tw else None,
+        "OD": last_rows[col_od] if col_od else None,
+        "Sched_Weight": last_rows[col_weight] if col_weight else None,
+        "Process": last_rows[col_process] if col_process else None,
+        "Next": last_rows[col_next] if col_next else None,
+        "Pass": last_rows[col_pass] if col_pass else None,
+    })
+    return out, best_sheet
+
+
 def build_ready_table(l2_df, ann_df):
     merged = l2_df.merge(ann_df, on="_coil_key", how="inner")
     if merged.empty:
         return merged
 
     def is_match(row):
-        th = row.get("TH_mm")
-        if pd.isna(th):
-            return True
-        return abs(row["Exit_mm"] - th) <= TOLERANCE_MM
+        target = row.get("Targeted_Th_mm")
+        if pd.isna(target):
+            return False
+        # exact match (rounded to 2 decimals to avoid float noise, e.g. 0.5800000001)
+        return round(row["Exit_mm"], 2) == round(target, 2)
 
     merged["_matched"] = merged.apply(is_match, axis=1)
     return merged[merged["_matched"]].copy()
+
+
+def build_missing_temp_table(l2_df, master_df, ann_df):
+    """Coils that (per the master plan) truly reached their final Targeted Th.
+    and are headed to Final Annealing, but have NO designated temperature
+    recorded in the small Ann list (either missing from it, or blank HEAT-S.T).
+    """
+    merged = l2_df.merge(master_df, on="_coil_key", how="inner")
+    if merged.empty:
+        return merged
+
+    def is_match(row):
+        target = row.get("Targeted_Th_mm_master")
+        if pd.isna(target):
+            return False
+        return round(row["Exit_mm"], 2) == round(target, 2)
+
+    merged["_matched"] = merged.apply(is_match, axis=1)
+    final_coils = merged[merged["_matched"]].copy()
+    if final_coils.empty:
+        return final_coils
+
+    # Only coils actually routed to Final Annealing next (not INT Trim, CM, etc.)
+    def is_final_ann(v):
+        if pd.isna(v):
+            return False
+        v = str(v).lower()
+        return "f ann" in v or "final ann" in v
+
+    final_coils = final_coils[final_coils["Next"].apply(is_final_ann)].copy()
+    if final_coils.empty:
+        return final_coils
+
+    temp_lookup = ann_df[["_coil_key", "Designated_Temp"]].drop_duplicates("_coil_key")
+    final_coils = final_coils.merge(temp_lookup, on="_coil_key", how="left")
+
+    def temp_missing(v):
+        return pd.isna(v) or str(v).strip() == ""
+
+    final_coils["_temp_missing"] = final_coils["Designated_Temp"].apply(temp_missing)
+    return final_coils[final_coils["_temp_missing"]].copy()
 
 
 def style_workbook(df):
@@ -246,14 +376,15 @@ def style_workbook(df):
 st.title("🔥 Final Annealing — Coils Ready Tool")
 st.caption("Upload the L2 machine report + Ann list file. The tool cross-references them and returns a ready styled table for coils that finished CRM and reached their target thickness.")
 
-col1, col2 = st.columns(2)
+st.caption("Matching rule: a coil counts as **Final** only if its Exit Thickness (last L2 pass) is an **exact** match to Targeted Th. (rounded to 2 decimals).")
+
+col1, col2, col3 = st.columns(3)
 with col1:
     l2_file = st.file_uploader("L2 Machine Report", type=["xls", "xlsx"])
 with col2:
-    ann_file = st.file_uploader("Ann List file (with Targeted Th. + HEAT - S.T)", type=["xls", "xlsx"])
-
-tolerance = st.slider("Matching tolerance (mm)", 0.0, 0.10, TOLERANCE_MM, 0.01)
-TOLERANCE_MM = tolerance
+    ann_file = st.file_uploader("Ann List (with Targeted Th. + HEAT - S.T)", type=["xls", "xlsx"])
+with col3:
+    master_file = st.file_uploader("Cold Rolling Plan (Master) — optional", type=["xls", "xlsx"])
 
 if l2_file and ann_file:
     if st.button("Process", type="primary"):
@@ -267,7 +398,7 @@ if l2_file and ann_file:
             ready_df = build_ready_table(l2_df, ann_df)
 
             if ready_df.empty:
-                st.warning("No coils matched — none of the L2 coils reached their target thickness for this stage yet.")
+                st.warning("No coils matched — none of the L2 coils reached their Targeted Th. exactly yet.")
             else:
                 st.success(f"{len(ready_df)} coil(s) ready for Final Annealing")
                 display_cols = {
@@ -279,12 +410,42 @@ if l2_file and ann_file:
 
                 excel_buf = style_workbook(ready_df)
                 st.download_button(
-                    "⬇️ Download Excel",
+                    "⬇️ Download Excel — Ready Coils",
                     data=excel_buf,
                     file_name=f"Final_Annealing_Ready_Coils_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_ready",
                 )
+
+            if master_file:
+                st.divider()
+                st.subheader("⚠️ Reached Final Thickness but Missing Designated Temperature")
+                st.caption("Cross-checked against the master Cold Rolling Plan (authoritative Targeted Th.) — coils that truly reached final gauge and are headed to Final Annealing, but have no HEAT-S.T recorded in the Ann list yet.")
+                with st.spinner("Reading master Cold Rolling Plan..."):
+                    master_df, master_sheet = load_master_plan(master_file)
+                st.caption(f"Master sheet used: **{master_sheet}**")
+
+                missing_df = build_missing_temp_table(l2_df, master_df, ann_df)
+                if missing_df.empty:
+                    st.info("None — every coil that reached its final target thickness already has a designated temperature.")
+                else:
+                    st.warning(f"{len(missing_df)} coil(s) need a temperature assigned")
+                    miss_display_cols = {
+                        "_coil_no_display": "Coil No.", "Customer": "Customer", "Alloy": "Alloy",
+                        "Temper": "Temper", "Exit_mm": "Reached Th. (mm)",
+                        "Targeted_Th_mm_master": "Final Targeted Th. (mm)", "Next": "Next Process",
+                    }
+                    st.dataframe(missing_df[list(miss_display_cols.keys())].rename(columns=miss_display_cols), use_container_width=True)
+
+                    excel_buf2 = style_workbook(missing_df.rename(columns={"Targeted_Th_mm_master": "Targeted_Th_mm"}))
+                    st.download_button(
+                        "⬇️ Download Excel — Missing Temperature List",
+                        data=excel_buf2,
+                        file_name=f"Missing_Temperature_Coils_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_missing",
+                    )
         except Exception as e:
             st.error(f"Error: {e}")
 else:
-    st.info("Upload both files to start.")
+    st.info("Upload the L2 report and Ann list to start. The master Cold Rolling Plan is optional but needed for the 'missing temperature' check.")
