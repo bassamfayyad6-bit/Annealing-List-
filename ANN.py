@@ -248,24 +248,15 @@ def load_master_plan(uploaded_file):
 INT_ANN_FIXED_TEMP = "360°C - 3 h"  # Int Ann temperature is always fixed, regardless of anything else
 
 
+FINAL_ANN_TOLERANCE_MM = 0.02  # accepted as a match, but flagged for review if not exact
+
+
 def classify_coils(l2_df, master_df, ann_df):
     """For every coil that finished a pass at Cold Mill (present in L2),
-    classify into:
-      - Int Ann: master says Next = INT Ann and the coil reached that
-        stage's target thickness (per master) within ±0.02mm tolerance.
-        Temperature is always fixed (360C), no matter what.
-      - Final Ann - With Temp: the coil is in the Ann list, reached its
-        EXACT Targeted Th. (per the Ann list — this is the freshest source,
-        updated more often than the master plan), and already has a
-        designated temperature there.
-      - Final Ann - No Temp: the coil is routed to Final Annealing per the
-        master plan and reached its EXACT target thickness there, but is
-        NOT yet present in the Ann list at all (i.e. nobody has
-        scheduled/assigned it a temperature yet).
-    Note: the master Cold Rolling Plan can lag behind the Ann list for
-    coils that have progressed since the master was last exported, so the
-    Ann list is treated as the source of truth for Final Ann thickness
-    whenever the coil is already listed there.
+    classify into Int Ann / Final Ann - With Temp / Final Ann - No Temp.
+    A coil counts as reaching its target thickness if the difference is
+    within ±0.02mm. Rows where the difference isn't exactly zero are
+    flagged (via a '_flag_diff' column) so they can be double-checked.
     Returns (int_ann_df, final_with_temp_df, final_no_temp_df).
     """
     # --- Final Ann: match against the Ann list first (freshest data) ---
@@ -275,9 +266,13 @@ def classify_coils(l2_df, master_df, ann_df):
             target = row.get("Targeted_Th_mm")
             if pd.isna(target):
                 return False
-            return round(row["Exit_mm"], 2) == round(target, 2)
+            return round(abs(row["Exit_mm"] - target), 4) <= FINAL_ANN_TOLERANCE_MM
 
         ann_merged["_reached"] = ann_merged.apply(reached_ann_target, axis=1)
+        ann_merged["_flag_diff"] = ann_merged.apply(
+            lambda r: pd.notna(r.get("Targeted_Th_mm")) and round(r["Exit_mm"], 2) != round(r["Targeted_Th_mm"], 2),
+            axis=1,
+        )
 
         def is_final_ann_next(v):
             if pd.isna(v):
@@ -305,22 +300,17 @@ def classify_coils(l2_df, master_df, ann_df):
         empty = master_merged.copy()
         return empty, final_with_temp_df, empty.copy()
 
-    INT_ANN_TOLERANCE_MM = 0.02  # Int Ann allows ±0.02mm vs the master's Targeted Th.
-
-    def reached_master_target_exact(row):
+    def reached_master_target(row):
         target = row.get("Targeted_Th_mm_master")
         if pd.isna(target):
             return False
-        return round(row["Exit_mm"], 2) == round(target, 2)
+        return round(abs(row["Exit_mm"] - target), 4) <= FINAL_ANN_TOLERANCE_MM
 
-    def reached_master_target_tolerant(row):
-        target = row.get("Targeted_Th_mm_master")
-        if pd.isna(target):
-            return False
-        return abs(row["Exit_mm"] - target) <= INT_ANN_TOLERANCE_MM
-
-    master_merged["_reached_exact"] = master_merged.apply(reached_master_target_exact, axis=1)
-    master_merged["_reached_tolerant"] = master_merged.apply(reached_master_target_tolerant, axis=1)
+    master_merged["_reached"] = master_merged.apply(reached_master_target, axis=1)
+    master_merged["_flag_diff"] = master_merged.apply(
+        lambda r: pd.notna(r.get("Targeted_Th_mm_master")) and round(r["Exit_mm"], 2) != round(r["Targeted_Th_mm_master"], 2),
+        axis=1,
+    )
 
     def next_kind(v):
         if pd.isna(v):
@@ -334,18 +324,19 @@ def classify_coils(l2_df, master_df, ann_df):
 
     master_merged["_kind"] = master_merged["Next"].apply(next_kind)
 
-    int_ann_df = master_merged[(master_merged["_kind"] == "int_ann") & (master_merged["_reached_tolerant"])].copy()
+    int_ann_df = master_merged[(master_merged["_kind"] == "int_ann") & (master_merged["_reached"])].copy()
     if not int_ann_df.empty:
         int_ann_df["Designated_Temp"] = INT_ANN_FIXED_TEMP  # always fixed, overrides anything else
 
     ann_coil_keys = set(ann_df["_coil_key"])
     final_no_temp_df = master_merged[
         (master_merged["_kind"] == "final_ann")
-        & (master_merged["_reached_exact"])
+        & (master_merged["_reached"])
         & (~master_merged["_coil_key"].isin(ann_coil_keys))
     ].copy()
 
     return int_ann_df, final_with_temp_df, final_no_temp_df
+
 
 
 
@@ -431,6 +422,7 @@ def _write_annealing_sheet(ws, df):
     thin = Side(style="thin", color="B7B7B7")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     center = Alignment(horizontal="center", vertical="center")
+    flag_fill = PatternFill("solid", fgColor="FFF2CC")  # light yellow - "please double-check"
 
     for c in range(1, len(ANNEALING_HEADERS) + 1):
         cell = ws.cell(row=hdr_row, column=c)
@@ -471,6 +463,9 @@ def _write_annealing_sheet(ws, df):
             cell.alignment = center
         ws[f"I{r}"].number_format = "0.00"
         ws[f"O{r}"].number_format = "0.00"
+        if row.get("_flag_diff"):
+            ws[f"I{r}"].fill = flag_fill
+            ws[f"O{r}"].fill = flag_fill
         r += 1
 
     for i, w in enumerate(ANNEALING_COL_WIDTHS, start=1):
@@ -522,14 +517,8 @@ def build_classification_workbook(int_ann_df, final_with_temp_df, final_no_temp_
 # ---------------------------------------------------------------------------
 
 st.title("🔥 Annealing Routing Tool")
-st.caption("Upload the L2 report, the Ann list, and the master Cold Rolling Plan. The tool finds every coil that finished a Cold Mill pass and classifies it by where it's headed next.")
-
-st.caption(
-    "**Int Ann**: routed to Intermediate Annealing, reached target thickness within **±0.02mm** — temperature is always fixed at "
-    f"**{'360°C - 3 h'}**, regardless of the exact thickness or anything else.  \n"
-    "**Final Ann - With Temp**: routed to Final Annealing, reached the **exact** final Targeted Th. (per the Ann list), and already has a designated temperature.  \n"
-    "**Final Ann - No Temp**: reached the exact final Targeted Th. per the master plan, but not yet in the Ann list — needs a temperature assigned."
-)
+st.caption("Upload the L2 report, the Ann list, and the master Cold Rolling Plan. The tool finds every coil that finished a Cold Mill pass and sorts it into Int Ann / Final Ann - With Temp / Final Ann - No Temp.")
+st.caption("Rows highlighted in yellow in the downloaded file have a small thickness difference — please double-check those.")
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -563,7 +552,10 @@ if l2_file and ann_file and master_file:
                 }
                 if "Designated_Temp" in df.columns:
                     cols["Designated_Temp"] = "Temp"
-                return df[list(cols.keys())].rename(columns=cols)
+                out = df[list(cols.keys())].rename(columns=cols)
+                if "_flag_diff" in df.columns:
+                    out.insert(0, "⚠️", df["_flag_diff"].apply(lambda v: "⚠️" if v else ""))
+                return out
 
             st.divider()
             st.subheader(f"🟠 Int Ann ({len(int_ann_df)})")
