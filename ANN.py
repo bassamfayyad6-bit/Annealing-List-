@@ -107,7 +107,7 @@ def load_ann_target_sheet(uploaded_file):
             col_coil = find_col(df.columns, "COIL Man") or find_col(df.columns, "Coil")
             col_th = find_col(df.columns, "TH [mm]") or find_col(df.columns, "TH")
             col_customer = find_col(df.columns, "Customer")
-            col_alloy = find_col(df.columns, "A") if "A" in df.columns else find_col(df.columns, "Alloy")
+            col_alloy = "A" if "A" in df.columns else find_col(df.columns, "Alloy")
             col_temper = find_col(df.columns, "T.T")
             col_width = find_col(df.columns, "Width")
             col_tw = find_col(df.columns, "T.W")
@@ -116,6 +116,9 @@ def load_ann_target_sheet(uploaded_file):
             col_process = find_col(df.columns, "Process")
             col_next = find_col(df.columns, "NEXT")
             col_pass = find_col(df.columns, "PASS")
+            col_trim = find_col(df.columns, "Int", "Trim")
+            col_spool = find_col(df.columns, "Steel spool")
+            col_pseq = find_col(df.columns, "P.Seq") or find_col(df.columns, "P.Seq.")
 
             df = df.copy()
             df["_coil_key"] = df[col_coil].apply(normalize_coil)
@@ -135,6 +138,9 @@ def load_ann_target_sheet(uploaded_file):
                 "Process": df[col_process] if col_process else None,
                 "Next": df[col_next] if col_next else None,
                 "Pass": df[col_pass] if col_pass else None,
+                "Trim": df[col_trim] if col_trim else None,
+                "SteelSpool": df[col_spool] if col_spool else None,
+                "PSeq": df[col_pseq] if col_pseq else None,
                 "Designated_Temp": df[col_heat],
             })
             return out, sheet
@@ -195,12 +201,15 @@ def load_master_plan(uploaded_file):
     col_process = find_col(df.columns, "Process")
     col_next = find_col(df.columns, "NEXT")
     col_customer = find_col(df.columns, "Customer")
-    col_alloy = find_col(df.columns, "A") if "A" in df.columns else find_col(df.columns, "Alloy")
+    col_alloy = "A" if "A" in df.columns else find_col(df.columns, "Alloy")
     col_temper = find_col(df.columns, "T.T")
     col_width = find_col(df.columns, "Width")
     col_tw = find_col(df.columns, "T.W")
     col_od = find_col(df.columns, "OD")
     col_weight = find_col(df.columns, "Weight")
+    col_trim = find_col(df.columns, "Int", "Trim")
+    col_spool = find_col(df.columns, "Steel spool")
+    col_pseq = find_col(df.columns, "P.Seq") or find_col(df.columns, "P.Seq.")
 
     df = df.dropna(subset=[col_coil]).copy()
     df["_coil_key"] = df[col_coil].apply(normalize_coil)
@@ -229,8 +238,70 @@ def load_master_plan(uploaded_file):
         "Process": last_rows[col_process] if col_process else None,
         "Next": last_rows[col_next] if col_next else None,
         "Pass": last_rows[col_pass] if col_pass else None,
+        "Trim": last_rows[col_trim] if col_trim else None,
+        "SteelSpool": last_rows[col_spool] if col_spool else None,
+        "PSeq": last_rows[col_pseq] if col_pseq else None,
     })
     return out, best_sheet
+
+
+INT_ANN_FIXED_TEMP = "360°C - 3 h"  # Int Ann temperature is always fixed, regardless of anything else
+
+
+def classify_coils(l2_df, master_df, ann_df):
+    """For every coil that finished a pass at Cold Mill (present in L2), look
+    up its routing in the master Cold Rolling Plan and classify into:
+      - Int Ann: Next = INT Ann. Temperature is always fixed (360C), no
+        matter what the thickness or anything else says.
+      - Final Ann - With Temp: Next = F Ann, reached the exact final
+        Targeted Th., and has a designated temperature in the Ann list.
+      - Final Ann - No Temp: same as above but missing the designated
+        temperature in the Ann list (needs manual assignment).
+    Coils not routed to any annealing step (CM, INT Trim, etc.) are ignored.
+    Returns (int_ann_df, final_with_temp_df, final_no_temp_df).
+    """
+    merged = l2_df.merge(master_df, on="_coil_key", how="inner")
+    if merged.empty:
+        empty = merged.copy()
+        return empty, empty.copy(), empty.copy()
+
+    temp_lookup = ann_df[["_coil_key", "Designated_Temp"]].drop_duplicates("_coil_key")
+    merged = merged.merge(temp_lookup, on="_coil_key", how="left")
+
+    def next_kind(v):
+        if pd.isna(v):
+            return None
+        v = str(v).lower()
+        if "int ann" in v or "intermediate ann" in v:
+            return "int_ann"
+        if "f ann" in v or "final ann" in v:
+            return "final_ann"
+        return None
+
+    merged["_kind"] = merged["Next"].apply(next_kind)
+
+    def reached_final(row):
+        target = row.get("Targeted_Th_mm_master")
+        if pd.isna(target):
+            return False
+        return round(row["Exit_mm"], 2) == round(target, 2)
+
+    merged["_reached_final"] = merged.apply(reached_final, axis=1)
+
+    def temp_missing(v):
+        return pd.isna(v) or str(v).strip() == ""
+
+    merged["_temp_missing"] = merged["Designated_Temp"].apply(temp_missing)
+
+    int_ann_df = merged[merged["_kind"] == "int_ann"].copy()
+    if not int_ann_df.empty:
+        int_ann_df["Designated_Temp"] = INT_ANN_FIXED_TEMP  # always fixed, overrides anything in Ann list
+
+    final_ready = merged[(merged["_kind"] == "final_ann") & (merged["_reached_final"])].copy()
+    final_with_temp_df = final_ready[~final_ready["_temp_missing"]].copy()
+    final_no_temp_df = final_ready[final_ready["_temp_missing"]].copy()
+
+    return int_ann_df, final_with_temp_df, final_no_temp_df
 
 
 def build_ready_table(l2_df, ann_df):
@@ -290,78 +361,106 @@ def build_missing_temp_table(l2_df, master_df, ann_df):
     return final_coils[final_coils["_temp_missing"]].copy()
 
 
-def style_workbook(df):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Ready for F.Ann"
+ANNEALING_HEADERS = [
+    "NO", "Customer", "HEAT - S.T", "COIL Man #", "HM thickness",
+    "final thickness", "A", "T.T", "Current thickness", "Width", "T.W",
+    "Int + Final Trim", "OD [mm]", "Weight [Kg]", "Targeted Th.",
+    "Steel spool", "PASS", "Process", "NEXT", "Processed", "P.Seq.",
+    "RR", "B.R.R", "CRR",
+]
+ANNEALING_COL_WIDTHS = [6, 26, 12, 14, 12, 12, 8, 8, 14, 9, 9, 12, 11, 12, 12, 11, 8, 10, 10, 10, 8, 8, 8, 8]
 
-    headers = [
-        "Coil No.", "Customer", "Alloy", "Temper", "Last Pass",
-        "Entry Th. (mm)", "Reached Th. (mm)", "Final Targeted Th. (mm)",
-        "Width (mm)", "T.W (mm)", "OD (mm)", "Sched. Weight (kg)",
-        "Measured Weight (kg)", "Current Process", "Next Process",
-        "Rolling End Time", "Avg Speed (m/min)", "Designated Ann. Temp & Time",
-    ]
 
-    ws.append(["FINAL ANNEALING - COILS READY (Reached Target Thickness at CRM)"])
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
-    ws["A1"].font = Font(bold=True, size=13, color="1F3864")
-    ws.append([f"Generated: {datetime.now().strftime('%d-%b-%Y %H:%M')}"])
-    ws.append([])
-
-    hdr_row = 4
-    ws.append(headers)
-    title_fill = PatternFill("solid", fgColor=TITLE_FILL)
-    title_font = Font(bold=True, color="FFFFFF", size=11)
+def _write_annealing_sheet(ws, df):
+    """Writes one dataframe into a worksheet using the plant's own
+    'ANNEALING' sheet layout exactly (see ANNEALING_HEADERS). Fields we don't
+    have a data source for (HM thickness, final thickness, Processed, RR,
+    B.R.R, CRR) are left blank rather than guessed.
+    """
+    hdr_row = 1
+    ws.append(ANNEALING_HEADERS)
+    header_font = Font(bold=True)
     header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
     thin = Side(style="thin", color="B7B7B7")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     center = Alignment(horizontal="center", vertical="center")
 
-    for c in range(1, len(headers) + 1):
+    for c in range(1, len(ANNEALING_HEADERS) + 1):
         cell = ws.cell(row=hdr_row, column=c)
-        cell.fill = title_fill
-        cell.font = title_font
+        cell.font = header_font
         cell.alignment = header_align
         cell.border = border
 
     r = hdr_row + 1
-    for _, row in df.iterrows():
-        weight_kg = row["_weight_t"] * 1000 if pd.notna(row.get("_weight_t")) else None
-        end_time = row.get("_end_time")
-        end_time_str = end_time.strftime("%d-%b-%Y %H:%M") if isinstance(end_time, (datetime,)) else (
-            str(end_time) if pd.notna(end_time) else ""
-        )
+    for i, (_, row) in enumerate(df.iterrows(), start=1):
         values = [
-            row["_coil_no_display"], row.get("Customer"), row.get("Alloy"), row.get("Temper"),
-            row.get("Pass") or row.get("_pass_no"), round(row["Entry_mm"], 2), round(row["Exit_mm"], 2),
-            row.get("Targeted_Th_mm"), row.get("Width"), row.get("TW"), row.get("OD"),
-            row.get("Sched_Weight"), weight_kg, row.get("Process"), row.get("Next"),
-            end_time_str, row.get("_speed"), row.get("Designated_Temp"),
+            i,
+            row.get("Customer"),
+            row.get("Designated_Temp"),
+            row["_coil_no_display"],
+            None,  # HM thickness - no data source
+            None,  # final thickness - no data source
+            row.get("Alloy"),
+            row.get("Temper"),
+            round(row["Exit_mm"], 2),
+            row.get("Width"),
+            row.get("TW"),
+            row.get("Trim"),
+            row.get("OD"),
+            row.get("Sched_Weight"),
+            row.get("Targeted_Th_mm") if "Targeted_Th_mm" in row else row.get("Targeted_Th_mm_master"),
+            row.get("SteelSpool"),
+            row.get("Pass") or row.get("_pass_no"),
+            row.get("Process"),
+            row.get("Next"),
+            None,  # Processed - no data source
+            row.get("PSeq"),
+            None, None, None,  # RR, B.R.R, CRR - no data source
         ]
         ws.append(values)
-        for c in range(1, len(headers) + 1):
+        for c in range(1, len(ANNEALING_HEADERS) + 1):
             cell = ws.cell(row=r, column=c)
             cell.border = border
             cell.alignment = center
+        ws[f"I{r}"].number_format = "0.00"
+        ws[f"O{r}"].number_format = "0.00"
         r += 1
 
-    for row in range(hdr_row + 1, r):
-        for col_letter in ["F", "G", "H"]:
-            ws[f"{col_letter}{row}"].number_format = "0.00"
-        for col_letter in ["L", "M"]:
-            ws[f"{col_letter}{row}"].number_format = "#,##0"
-
-    widths = [14, 30, 8, 10, 10, 12, 13, 16, 11, 10, 11, 14, 15, 13, 12, 16, 12, 20]
-    for i, w in enumerate(widths, start=1):
+    for i, w in enumerate(ANNEALING_COL_WIDTHS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
-    ws.auto_filter.ref = f"A{hdr_row}:{get_column_letter(len(headers))}{hdr_row}"
+    ws.auto_filter.ref = f"A{hdr_row}:{get_column_letter(len(ANNEALING_HEADERS))}{hdr_row}"
     ws.freeze_panes = f"A{hdr_row + 1}"
 
     for r_ in ws.iter_rows():
         for c_ in r_:
-            c_.font = Font(name="Arial", size=c_.font.size or 10, bold=c_.font.bold, color=c_.font.color)
+            c_.font = Font(name="Arial", size=10, bold=c_.font.bold)
+
+
+def style_workbook(df):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "ANNEALING"
+    _write_annealing_sheet(ws, df)
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def build_classification_workbook(int_ann_df, final_with_temp_df, final_no_temp_df):
+    """One workbook, three tabs: INT ANN / FINAL ANN - WITH TEMP / FINAL ANN - NO TEMP."""
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    ws1 = wb.create_sheet("INT ANN")
+    _write_annealing_sheet(ws1, int_ann_df)
+
+    ws2 = wb.create_sheet("FINAL ANN - WITH TEMP")
+    _write_annealing_sheet(ws2, final_with_temp_df)
+
+    ws3 = wb.create_sheet("FINAL ANN - NO TEMP")
+    _write_annealing_sheet(ws3, final_no_temp_df)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -369,14 +468,21 @@ def style_workbook(df):
     return buf
 
 
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
-st.title("🔥 Final Annealing — Coils Ready Tool")
-st.caption("Upload the L2 machine report + Ann list file. The tool cross-references them and returns a ready styled table for coils that finished CRM and reached their target thickness.")
+st.title("🔥 Annealing Routing Tool")
+st.caption("Upload the L2 report, the Ann list, and the master Cold Rolling Plan. The tool finds every coil that finished a Cold Mill pass and classifies it by where it's headed next.")
 
-st.caption("Matching rule: a coil counts as **Final** only if its Exit Thickness (last L2 pass) is an **exact** match to Targeted Th. (rounded to 2 decimals).")
+st.caption(
+    "**Int Ann**: routed to Intermediate Annealing — temperature is always fixed at "
+    f"**{'360°C - 3 h'}**, regardless of thickness or anything else.  \n"
+    "**Final Ann - With Temp**: routed to Final Annealing, reached the exact final Targeted Th., and already has a designated temperature.  \n"
+    "**Final Ann - No Temp**: same, but missing a designated temperature — needs manual assignment."
+)
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -384,68 +490,59 @@ with col1:
 with col2:
     ann_file = st.file_uploader("Ann List (with Targeted Th. + HEAT - S.T)", type=["xls", "xlsx"])
 with col3:
-    master_file = st.file_uploader("Cold Rolling Plan (Master) — optional", type=["xls", "xlsx"])
+    master_file = st.file_uploader("Cold Rolling Plan (Master)", type=["xls", "xlsx"])
 
-if l2_file and ann_file:
+if l2_file and ann_file and master_file:
     if st.button("Process", type="primary"):
         try:
             with st.spinner("Reading L2 report..."):
                 l2_df = load_l2_report(l2_file)
             with st.spinner("Reading Ann list..."):
-                ann_df, sheet_used = load_ann_target_sheet(ann_file)
-            st.success(f"Ann sheet used: **{sheet_used}**")
+                ann_df, ann_sheet = load_ann_target_sheet(ann_file)
+            with st.spinner("Reading master Cold Rolling Plan..."):
+                master_df, master_sheet = load_master_plan(master_file)
+            st.success(f"Ann sheet: **{ann_sheet}**  |  Master sheet: **{master_sheet}**")
 
-            ready_df = build_ready_table(l2_df, ann_df)
+            int_ann_df, final_with_temp_df, final_no_temp_df = classify_coils(l2_df, master_df, ann_df)
 
-            if ready_df.empty:
-                st.warning("No coils matched — none of the L2 coils reached their Targeted Th. exactly yet.")
+            display_cols = {
+                "_coil_no_display": "Coil No.", "Customer": "Customer", "Alloy": "Alloy",
+                "Temper": "Temper", "Exit_mm": "Reached Th. (mm)",
+                "Targeted_Th_mm_master": "Final Targeted Th. (mm)", "Designated_Temp": "Temp",
+            }
+
+            st.divider()
+            st.subheader(f"🟠 Int Ann ({len(int_ann_df)})")
+            if int_ann_df.empty:
+                st.info("No coils currently routed to Intermediate Annealing.")
             else:
-                st.success(f"{len(ready_df)} coil(s) ready for Final Annealing")
-                display_cols = {
-                    "_coil_no_display": "Coil No.", "Customer": "Customer", "Alloy": "Alloy",
-                    "Temper": "Temper", "Exit_mm": "Reached Th. (mm)",
-                    "Targeted_Th_mm": "Final Targeted Th. (mm)", "Designated_Temp": "Designated Temp",
-                }
-                st.dataframe(ready_df[list(display_cols.keys())].rename(columns=display_cols), use_container_width=True)
+                st.dataframe(int_ann_df[list(display_cols.keys())].rename(columns=display_cols), use_container_width=True)
 
-                excel_buf = style_workbook(ready_df)
-                st.download_button(
-                    "⬇️ Download Excel — Ready Coils",
-                    data=excel_buf,
-                    file_name=f"Final_Annealing_Ready_Coils_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl_ready",
-                )
+            st.divider()
+            st.subheader(f"🟢 Final Ann - With Temp ({len(final_with_temp_df)})")
+            if final_with_temp_df.empty:
+                st.info("No coils currently ready with a designated temperature.")
+            else:
+                st.dataframe(final_with_temp_df[list(display_cols.keys())].rename(columns=display_cols), use_container_width=True)
 
-            if master_file:
-                st.divider()
-                st.subheader("⚠️ Reached Final Thickness but Missing Designated Temperature")
-                st.caption("Cross-checked against the master Cold Rolling Plan (authoritative Targeted Th.) — coils that truly reached final gauge and are headed to Final Annealing, but have no HEAT-S.T recorded in the Ann list yet.")
-                with st.spinner("Reading master Cold Rolling Plan..."):
-                    master_df, master_sheet = load_master_plan(master_file)
-                st.caption(f"Master sheet used: **{master_sheet}**")
+            st.divider()
+            st.subheader(f"🔴 Final Ann - No Temp ({len(final_no_temp_df)})")
+            if final_no_temp_df.empty:
+                st.info("No coils are missing a temperature right now.")
+            else:
+                st.warning(f"{len(final_no_temp_df)} coil(s) need a temperature assigned")
+                st.dataframe(final_no_temp_df[list(display_cols.keys())].drop(columns=["Designated_Temp"]).rename(columns=display_cols), use_container_width=True)
 
-                missing_df = build_missing_temp_table(l2_df, master_df, ann_df)
-                if missing_df.empty:
-                    st.info("None — every coil that reached its final target thickness already has a designated temperature.")
-                else:
-                    st.warning(f"{len(missing_df)} coil(s) need a temperature assigned")
-                    miss_display_cols = {
-                        "_coil_no_display": "Coil No.", "Customer": "Customer", "Alloy": "Alloy",
-                        "Temper": "Temper", "Exit_mm": "Reached Th. (mm)",
-                        "Targeted_Th_mm_master": "Final Targeted Th. (mm)", "Next": "Next Process",
-                    }
-                    st.dataframe(missing_df[list(miss_display_cols.keys())].rename(columns=miss_display_cols), use_container_width=True)
-
-                    excel_buf2 = style_workbook(missing_df.rename(columns={"Targeted_Th_mm_master": "Targeted_Th_mm"}))
-                    st.download_button(
-                        "⬇️ Download Excel — Missing Temperature List",
-                        data=excel_buf2,
-                        file_name=f"Missing_Temperature_Coils_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="dl_missing",
-                    )
+            st.divider()
+            excel_buf = build_classification_workbook(int_ann_df, final_with_temp_df, final_no_temp_df)
+            st.download_button(
+                "⬇️ Download Excel (3 tabs: Int Ann / Final Ann - With Temp / Final Ann - No Temp)",
+                data=excel_buf,
+                file_name=f"Annealing_Routing_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_classification",
+            )
         except Exception as e:
             st.error(f"Error: {e}")
 else:
-    st.info("Upload the L2 report and Ann list to start. The master Cold Rolling Plan is optional but needed for the 'missing temperature' check.")
+    st.info("Upload all three files (L2 report, Ann list, and the master Cold Rolling Plan) to start.")
