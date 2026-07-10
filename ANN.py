@@ -249,24 +249,78 @@ INT_ANN_FIXED_TEMP = "360°C - 3 h"  # Int Ann temperature is always fixed, rega
 
 
 def classify_coils(l2_df, master_df, ann_df):
-    """For every coil that finished a pass at Cold Mill (present in L2), look
-    up its routing in the master Cold Rolling Plan and classify into:
-      - Int Ann: Next = INT Ann. Temperature is always fixed (360C), no
-        matter what the thickness or anything else says.
-      - Final Ann - With Temp: Next = F Ann, reached the exact final
-        Targeted Th., and has a designated temperature in the Ann list.
-      - Final Ann - No Temp: same as above but missing the designated
-        temperature in the Ann list (needs manual assignment).
-    Coils not routed to any annealing step (CM, INT Trim, etc.) are ignored.
+    """For every coil that finished a pass at Cold Mill (present in L2),
+    classify into:
+      - Int Ann: master says Next = INT Ann and the coil reached that
+        stage's target thickness (per master) within ±0.02mm tolerance.
+        Temperature is always fixed (360C), no matter what.
+      - Final Ann - With Temp: the coil is in the Ann list, reached its
+        EXACT Targeted Th. (per the Ann list — this is the freshest source,
+        updated more often than the master plan), and already has a
+        designated temperature there.
+      - Final Ann - No Temp: the coil is routed to Final Annealing per the
+        master plan and reached its EXACT target thickness there, but is
+        NOT yet present in the Ann list at all (i.e. nobody has
+        scheduled/assigned it a temperature yet).
+    Note: the master Cold Rolling Plan can lag behind the Ann list for
+    coils that have progressed since the master was last exported, so the
+    Ann list is treated as the source of truth for Final Ann thickness
+    whenever the coil is already listed there.
     Returns (int_ann_df, final_with_temp_df, final_no_temp_df).
     """
-    merged = l2_df.merge(master_df, on="_coil_key", how="inner")
-    if merged.empty:
-        empty = merged.copy()
-        return empty, empty.copy(), empty.copy()
+    # --- Final Ann: match against the Ann list first (freshest data) ---
+    ann_merged = l2_df.merge(ann_df, on="_coil_key", how="inner")
+    if not ann_merged.empty:
+        def reached_ann_target(row):
+            target = row.get("Targeted_Th_mm")
+            if pd.isna(target):
+                return False
+            return round(row["Exit_mm"], 2) == round(target, 2)
 
-    temp_lookup = ann_df[["_coil_key", "Designated_Temp"]].drop_duplicates("_coil_key")
-    merged = merged.merge(temp_lookup, on="_coil_key", how="left")
+        ann_merged["_reached"] = ann_merged.apply(reached_ann_target, axis=1)
+
+        def is_final_ann_next(v):
+            if pd.isna(v):
+                return False
+            v = str(v).lower()
+            return "f ann" in v or "final ann" in v
+
+        ann_merged["_is_final"] = ann_merged["Next"].apply(is_final_ann_next)
+
+        def temp_present(v):
+            return not (pd.isna(v) or str(v).strip() == "")
+
+        ann_merged["_has_temp"] = ann_merged["Designated_Temp"].apply(temp_present)
+
+        final_with_temp_df = ann_merged[
+            ann_merged["_is_final"] & ann_merged["_reached"] & ann_merged["_has_temp"]
+        ].copy()
+    else:
+        final_with_temp_df = ann_merged.copy()
+
+    # --- Master plan: used for Int Ann, and for Final Ann coils that
+    # haven't been added to the Ann list yet at all ---
+    master_merged = l2_df.merge(master_df, on="_coil_key", how="inner")
+    if master_merged.empty:
+        empty = master_merged.copy()
+        return empty, final_with_temp_df, empty.copy()
+
+    INT_ANN_TOLERANCE_MM = 0.02  # Int Ann allows ±0.02mm vs the master's Targeted Th.
+
+    def reached_master_target_exact(row):
+        target = row.get("Targeted_Th_mm_master")
+        if pd.isna(target):
+            return False
+        return round(row["Exit_mm"], 2) == round(target, 2)
+
+    def reached_master_target_tolerant(row):
+        target = row.get("Targeted_Th_mm_master")
+        if pd.isna(target):
+            return False
+        return abs(row["Exit_mm"] - target) <= INT_ANN_TOLERANCE_MM
+
+    master_merged["_reached_exact"] = master_merged.apply(reached_master_target_exact, axis=1)
+    master_merged["_reached_tolerant"] = master_merged.apply(reached_master_target_tolerant, axis=1)
 
     def next_kind(v):
         if pd.isna(v):
@@ -278,30 +332,23 @@ def classify_coils(l2_df, master_df, ann_df):
             return "final_ann"
         return None
 
-    merged["_kind"] = merged["Next"].apply(next_kind)
+    master_merged["_kind"] = master_merged["Next"].apply(next_kind)
 
-    def reached_final(row):
-        target = row.get("Targeted_Th_mm_master")
-        if pd.isna(target):
-            return False
-        return round(row["Exit_mm"], 2) == round(target, 2)
-
-    merged["_reached_final"] = merged.apply(reached_final, axis=1)
-
-    def temp_missing(v):
-        return pd.isna(v) or str(v).strip() == ""
-
-    merged["_temp_missing"] = merged["Designated_Temp"].apply(temp_missing)
-
-    int_ann_df = merged[merged["_kind"] == "int_ann"].copy()
+    int_ann_df = master_merged[(master_merged["_kind"] == "int_ann") & (master_merged["_reached_tolerant"])].copy()
     if not int_ann_df.empty:
-        int_ann_df["Designated_Temp"] = INT_ANN_FIXED_TEMP  # always fixed, overrides anything in Ann list
+        int_ann_df["Designated_Temp"] = INT_ANN_FIXED_TEMP  # always fixed, overrides anything else
 
-    final_ready = merged[(merged["_kind"] == "final_ann") & (merged["_reached_final"])].copy()
-    final_with_temp_df = final_ready[~final_ready["_temp_missing"]].copy()
-    final_no_temp_df = final_ready[final_ready["_temp_missing"]].copy()
+    ann_coil_keys = set(ann_df["_coil_key"])
+    final_no_temp_df = master_merged[
+        (master_merged["_kind"] == "final_ann")
+        & (master_merged["_reached_exact"])
+        & (~master_merged["_coil_key"].isin(ann_coil_keys))
+    ].copy()
 
     return int_ann_df, final_with_temp_df, final_no_temp_df
+
+
+
 
 
 def build_ready_table(l2_df, ann_df):
@@ -478,10 +525,10 @@ st.title("🔥 Annealing Routing Tool")
 st.caption("Upload the L2 report, the Ann list, and the master Cold Rolling Plan. The tool finds every coil that finished a Cold Mill pass and classifies it by where it's headed next.")
 
 st.caption(
-    "**Int Ann**: routed to Intermediate Annealing — temperature is always fixed at "
-    f"**{'360°C - 3 h'}**, regardless of thickness or anything else.  \n"
-    "**Final Ann - With Temp**: routed to Final Annealing, reached the exact final Targeted Th., and already has a designated temperature.  \n"
-    "**Final Ann - No Temp**: same, but missing a designated temperature — needs manual assignment."
+    "**Int Ann**: routed to Intermediate Annealing, reached target thickness within **±0.02mm** — temperature is always fixed at "
+    f"**{'360°C - 3 h'}**, regardless of the exact thickness or anything else.  \n"
+    "**Final Ann - With Temp**: routed to Final Annealing, reached the **exact** final Targeted Th. (per the Ann list), and already has a designated temperature.  \n"
+    "**Final Ann - No Temp**: reached the exact final Targeted Th. per the master plan, but not yet in the Ann list — needs a temperature assigned."
 )
 
 col1, col2, col3 = st.columns(3)
@@ -505,25 +552,30 @@ if l2_file and ann_file and master_file:
 
             int_ann_df, final_with_temp_df, final_no_temp_df = classify_coils(l2_df, master_df, ann_df)
 
-            display_cols = {
-                "_coil_no_display": "Coil No.", "Customer": "Customer", "Alloy": "Alloy",
-                "Temper": "Temper", "Exit_mm": "Reached Th. (mm)",
-                "Targeted_Th_mm_master": "Final Targeted Th. (mm)", "Designated_Temp": "Temp",
-            }
+            def show_table(df):
+                if df.empty:
+                    return df
+                target_col = "Targeted_Th_mm" if "Targeted_Th_mm" in df.columns else "Targeted_Th_mm_master"
+                cols = {
+                    "_coil_no_display": "Coil No.", "Customer": "Customer", "Alloy": "Alloy",
+                    "Temper": "Temper", "Exit_mm": "Reached Th. (mm)",
+                    target_col: "Final Targeted Th. (mm)", "Designated_Temp": "Temp",
+                }
+                return df[list(cols.keys())].rename(columns=cols)
 
             st.divider()
             st.subheader(f"🟠 Int Ann ({len(int_ann_df)})")
             if int_ann_df.empty:
                 st.info("No coils currently routed to Intermediate Annealing.")
             else:
-                st.dataframe(int_ann_df[list(display_cols.keys())].rename(columns=display_cols), use_container_width=True)
+                st.dataframe(show_table(int_ann_df), use_container_width=True)
 
             st.divider()
             st.subheader(f"🟢 Final Ann - With Temp ({len(final_with_temp_df)})")
             if final_with_temp_df.empty:
                 st.info("No coils currently ready with a designated temperature.")
             else:
-                st.dataframe(final_with_temp_df[list(display_cols.keys())].rename(columns=display_cols), use_container_width=True)
+                st.dataframe(show_table(final_with_temp_df), use_container_width=True)
 
             st.divider()
             st.subheader(f"🔴 Final Ann - No Temp ({len(final_no_temp_df)})")
@@ -531,7 +583,7 @@ if l2_file and ann_file and master_file:
                 st.info("No coils are missing a temperature right now.")
             else:
                 st.warning(f"{len(final_no_temp_df)} coil(s) need a temperature assigned")
-                st.dataframe(final_no_temp_df[list(display_cols.keys())].drop(columns=["Designated_Temp"]).rename(columns=display_cols), use_container_width=True)
+                st.dataframe(show_table(final_no_temp_df).drop(columns=["Temp"]), use_container_width=True)
 
             st.divider()
             excel_buf = build_classification_workbook(int_ann_df, final_with_temp_df, final_no_temp_df)
