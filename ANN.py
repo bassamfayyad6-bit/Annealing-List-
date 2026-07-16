@@ -45,50 +45,120 @@ def find_col(columns, *candidates):
 
 def load_l2_report(uploaded_file):
     df = read_any_excel(uploaded_file, sheet_name=0)
-    df.columns = [str(c).strip() for c in df.columns]
+
+    # The CRM Daily Report has a title/metadata block before the real header
+    # row (which contains "Coil No."). Find that row and re-read from there.
+    header_row_idx = None
+    for i in range(min(10, len(df))):
+        row_vals = [str(v) for v in df.iloc[i].tolist() if pd.notna(v)]
+        if any("coil no" in v.lower() for v in row_vals):
+            header_row_idx = i
+            break
+
+    if header_row_idx is not None and header_row_idx > 0:
+        uploaded_file.seek(0)
+        df = read_any_excel(uploaded_file, sheet_name=0)
+        new_header = df.iloc[header_row_idx]
+        df = df.iloc[header_row_idx + 1:].copy()
+        df.columns = [str(c).strip() for c in new_header]
+    else:
+        df.columns = [str(c).strip() for c in df.columns]
 
     col_coil = find_col(df.columns, "Coil No.") or find_col(df.columns, "Coil No")
-    col_pass = find_col(df.columns, "Pass No")
-    col_entry = find_col(df.columns, "Entry Thickness")
-    col_exit = find_col(df.columns, "Exit Thickness")
+
+    # Format A: raw L2 machine report (Pass No., Entry/Exit Thickness [um])
+    col_pass_raw = find_col(df.columns, "Pass No")
+    col_entry_raw = find_col(df.columns, "Entry Thickness")
+    col_exit_raw = find_col(df.columns, "Exit Thickness")
+
+    # Format B: approved CRM Daily Report (Current Pass, thicknesses already in mm)
+    col_pass_daily = find_col(df.columns, "Current Pass")
+    col_entry_daily = find_col(df.columns, "Entry TH")
+    col_exit_daily = find_col(df.columns, "Exit TH")
+
+    is_daily_report = col_exit_daily is not None and col_exit_raw is None
+
     col_end = find_col(df.columns, "End Time")
-    col_speed = find_col(df.columns, "Avg. Mill Speed") or find_col(df.columns, "Avg Mill Speed")
-    col_weight = find_col(df.columns, "Measured Weight")
+    col_speed = find_col(df.columns, "Avg. Mill Speed") or find_col(df.columns, "Avg Mill Speed") or find_col(df.columns, "Actual Speed")
+    col_weight = find_col(df.columns, "Measured Weight") or find_col(df.columns, "HR Weight")
     col_alloy = find_col(df.columns, "Alloy")
+
+    col_next_dest = find_col(df.columns, "Next Destination")
+    col_target_final = find_col(df.columns, "Target Final TH") or find_col(df.columns, "Target Final")
+    col_customer_l2 = find_col(df.columns, "Customer")
+    col_temper_l2 = find_col(df.columns, "Temper")
+    col_width_l2 = find_col(df.columns, "Width")
+
+    if is_daily_report:
+        col_pass, col_entry, col_exit = col_pass_daily, col_entry_daily, col_exit_daily
+        thickness_divisor = 1.0  # already in mm
+    else:
+        col_pass, col_entry, col_exit = col_pass_raw, col_entry_raw, col_exit_raw
+        thickness_divisor = 1000.0  # given in micrometers
 
     required = [col_coil, col_pass, col_entry, col_exit]
     if any(c is None for c in required):
         raise ValueError(
             "L2 report: couldn't find one of the required columns "
-            "(Coil No. / Pass No. / Entry Thickness / Exit Thickness). "
+            "(Coil No. / Pass / Entry Thickness / Exit Thickness). "
             "Check the file's header row."
         )
 
     df["_coil_key"] = df[col_coil].apply(normalize_coil)
     df = df.dropna(subset=["_coil_key"])
+    df[col_entry] = pd.to_numeric(df[col_entry], errors="coerce")
+    df[col_exit] = pd.to_numeric(df[col_exit], errors="coerce")
+    if col_target_final:
+        df[col_target_final] = pd.to_numeric(df[col_target_final], errors="coerce")
+
+    def pass_num(v):
+        if pd.isna(v):
+            return -1
+        m = re.search(r"\d+", str(v))
+        return int(m.group()) if m else -1
+
+    df["_pass_sort"] = df[col_pass].apply(pass_num)
 
     # take the LAST pass per coil (highest Pass No.; tie-break by End Time)
-    sort_cols = [col_pass] + ([col_end] if col_end else [])
+    sort_cols = ["_pass_sort"] + ([col_end] if col_end else [])
     df_sorted = df.sort_values(sort_cols)
     last_pass = df_sorted.groupby("_coil_key", as_index=False).tail(1).copy()
 
-    last_pass["Entry_mm"] = last_pass[col_entry] / 1000.0
-    last_pass["Exit_mm"] = last_pass[col_exit] / 1000.0
+    last_pass["Entry_mm"] = last_pass[col_entry] / thickness_divisor
+    last_pass["Exit_mm"] = last_pass[col_exit] / thickness_divisor
     last_pass["_pass_no"] = last_pass[col_pass]
     last_pass["_end_time"] = last_pass[col_end] if col_end else None
     last_pass["_speed"] = last_pass[col_speed] if col_speed else None
-    last_pass["_weight_t"] = last_pass[col_weight] if col_weight else None
+    last_pass["_weight_t"] = (last_pass[col_weight] / 1000.0) if (col_weight and not is_daily_report) else (last_pass[col_weight] if col_weight else None)
     last_pass["_alloy"] = last_pass[col_alloy] if col_alloy else None
     last_pass["_coil_no_display"] = last_pass[col_coil]
+    # Daily Report already computes its own routing per coil (validated at
+    # generation time) - carry it through so classify_coils can use it as a
+    # fallback when the coil isn't found in the master plan at all.
+    last_pass["_daily_next"] = last_pass[col_next_dest] if col_next_dest else None
+    last_pass["_daily_target_mm"] = last_pass[col_target_final] if col_target_final else None
+    last_pass["_customer"] = last_pass[col_customer_l2] if col_customer_l2 else None
+    last_pass["_temper"] = last_pass[col_temper_l2] if col_temper_l2 else None
+    last_pass["_width"] = last_pass[col_width_l2] if col_width_l2 else None
 
     return last_pass[
         ["_coil_key", "_coil_no_display", "_pass_no", "Entry_mm", "Exit_mm",
-         "_end_time", "_speed", "_weight_t", "_alloy"]
+         "_end_time", "_speed", "_weight_t", "_alloy", "_daily_next",
+         "_daily_target_mm", "_customer", "_temper", "_width"]
     ]
 
 
 def load_ann_target_sheet(uploaded_file):
-    """Find the sheet inside the Ann workbook that has Targeted Th. + HEAT - S.T columns."""
+    """Find the sheet inside the Ann workbook with per-coil annealing info.
+    Supports two known formats:
+      A) Older 'Ann list' format: has 'Targeted Th.' (the thickness the coil
+         is aiming for) + 'NEXT' (destination, e.g. F Ann) + 'HEAT - S.T'.
+      B) Newer combined 'ANNEALING' sheet (inside the master workbook): has
+         no 'Targeted Th.' column. Instead 'Process' directly states the
+         annealing destination (INT Ann / F Ann) and 'Current thickness' is
+         the thickness that triggered the coil's inclusion here — this is
+         used as the match value instead of Targeted Th.
+    """
     name = uploaded_file.name.lower()
     data = uploaded_file.read()
     uploaded_file.seek(0)
@@ -98,6 +168,7 @@ def load_ann_target_sheet(uploaded_file):
     else:
         xls = pd.ExcelFile(io.BytesIO(data), engine="openpyxl")
 
+    # --- Pass 1: older format (Targeted Th. + HEAT - S.T) ---
     for sheet in xls.sheet_names:
         df = xls.parse(sheet)
         df.columns = [str(c).strip() for c in df.columns]
@@ -145,9 +216,60 @@ def load_ann_target_sheet(uploaded_file):
             })
             return out, sheet
 
+    # --- Pass 2: newer combined ANNEALING sheet format ---
+    for sheet in xls.sheet_names:
+        df = xls.parse(sheet)
+        df.columns = [str(c).strip() for c in df.columns]
+        col_coil = find_col(df.columns, "COIL Man")
+        col_heat = find_col(df.columns, "HEAT", "S.T") or find_col(df.columns, "HEAT - S.T")
+        col_current_th = find_col(df.columns, "Current thickness")
+        col_process = find_col(df.columns, "Process")
+        if col_coil and col_heat and col_current_th and col_process:
+            # only treat as valid if Process actually contains annealing values
+            sample_vals = df[col_process].dropna().astype(str).str.lower()
+            if not sample_vals.str.contains("ann").any():
+                continue
+
+            col_customer = find_col(df.columns, "Customer")
+            col_alloy = "A" if "A" in df.columns else find_col(df.columns, "Alloy")
+            col_temper = find_col(df.columns, "T.T")
+            col_width = find_col(df.columns, "Width")
+            col_tw = find_col(df.columns, "T.W")
+            col_od = find_col(df.columns, "OD")
+            col_weight = find_col(df.columns, "Weight")
+            col_next = find_col(df.columns, "NEXT")
+            col_trim = find_col(df.columns, "Int", "Trim")
+            col_spool = find_col(df.columns, "Steel spool")
+
+            df = df.copy()
+            df["_coil_key"] = df[col_coil].apply(normalize_coil)
+            df = df.dropna(subset=["_coil_key"])
+
+            out = pd.DataFrame({
+                "_coil_key": df["_coil_key"],
+                "Customer": df[col_customer] if col_customer else None,
+                "Alloy": df[col_alloy] if col_alloy else None,
+                "Temper": df[col_temper] if col_temper else None,
+                "TH_mm": df[col_current_th],
+                "Targeted_Th_mm": df[col_current_th],
+                "Width": df[col_width] if col_width else None,
+                "TW": df[col_tw] if col_tw else None,
+                "OD": df[col_od] if col_od else None,
+                "Sched_Weight": df[col_weight] if col_weight else None,
+                "Process": df[col_process],
+                "Next": df[col_process],  # Process IS the annealing destination in this format
+                "Pass": None,
+                "Trim": df[col_trim] if col_trim else None,
+                "SteelSpool": df[col_spool] if col_spool else None,
+                "PSeq": None,
+                "Designated_Temp": df[col_heat],
+            })
+            return out, sheet
+
     raise ValueError(
-        "Couldn't find a sheet in the Ann file with both 'Targeted Th.' and "
-        "'HEAT - S.T' columns. Check the file structure."
+        "Couldn't find a sheet in the Ann file with 'Targeted Th.' + "
+        "'HEAT - S.T', or the newer 'Current thickness' + 'Process' + "
+        "'HEAT - S.T' combined ANNEALING format. Check the file structure."
     )
 
 
@@ -282,6 +404,14 @@ def classify_coils(l2_df, master_df, ann_df):
 
         ann_merged["_is_final"] = ann_merged["Next"].apply(is_final_ann_next)
 
+        def is_int_ann_next(v):
+            if pd.isna(v):
+                return False
+            v = str(v).lower()
+            return "int ann" in v or "intermediate ann" in v
+
+        ann_merged["_is_int"] = ann_merged["Next"].apply(is_int_ann_next)
+
         def temp_present(v):
             return not (pd.isna(v) or str(v).strip() == "")
 
@@ -290,50 +420,98 @@ def classify_coils(l2_df, master_df, ann_df):
         final_with_temp_df = ann_merged[
             ann_merged["_is_final"] & ann_merged["_reached"] & ann_merged["_has_temp"]
         ].copy()
+        int_ann_from_ann_df = ann_merged[ann_merged["_is_int"] & ann_merged["_reached"]].copy()
+        if not int_ann_from_ann_df.empty:
+            int_ann_from_ann_df["Designated_Temp"] = INT_ANN_FIXED_TEMP
     else:
         final_with_temp_df = ann_merged.copy()
+        int_ann_from_ann_df = ann_merged.copy()
 
     # --- Master plan: used for Int Ann, and for Final Ann coils that
     # haven't been added to the Ann list yet at all ---
     master_merged = l2_df.merge(master_df, on="_coil_key", how="inner")
-    if master_merged.empty:
-        empty = master_merged.copy()
-        return empty, final_with_temp_df, empty.copy()
 
-    def reached_master_target(row):
-        target = row.get("Targeted_Th_mm_master")
-        if pd.isna(target):
-            return False
-        return round(abs(row["Exit_mm"] - target), 4) <= FINAL_ANN_TOLERANCE_MM
+    if not master_merged.empty:
+        def reached_master_target(row):
+            target = row.get("Targeted_Th_mm_master")
+            if pd.isna(target):
+                return False
+            return round(abs(row["Exit_mm"] - target), 4) <= FINAL_ANN_TOLERANCE_MM
 
-    master_merged["_reached"] = master_merged.apply(reached_master_target, axis=1)
-    master_merged["_flag_diff"] = master_merged.apply(
-        lambda r: pd.notna(r.get("Targeted_Th_mm_master")) and round(r["Exit_mm"], 2) != round(r["Targeted_Th_mm_master"], 2),
-        axis=1,
-    )
+        master_merged["_reached"] = master_merged.apply(reached_master_target, axis=1)
+        master_merged["_flag_diff"] = master_merged.apply(
+            lambda r: pd.notna(r.get("Targeted_Th_mm_master")) and round(r["Exit_mm"], 2) != round(r["Targeted_Th_mm_master"], 2),
+            axis=1,
+        )
 
-    def next_kind(v):
-        if pd.isna(v):
+        def next_kind(v):
+            if pd.isna(v):
+                return None
+            v = str(v).lower()
+            if "int ann" in v or "intermediate ann" in v:
+                return "int_ann"
+            if "f ann" in v or "final ann" in v:
+                return "final_ann"
             return None
-        v = str(v).lower()
-        if "int ann" in v or "intermediate ann" in v:
-            return "int_ann"
-        if "f ann" in v or "final ann" in v:
-            return "final_ann"
-        return None
 
-    master_merged["_kind"] = master_merged["Next"].apply(next_kind)
+        master_merged["_kind"] = master_merged["Next"].apply(next_kind)
 
-    int_ann_df = master_merged[(master_merged["_kind"] == "int_ann") & (master_merged["_reached"])].copy()
-    if not int_ann_df.empty:
-        int_ann_df["Designated_Temp"] = INT_ANN_FIXED_TEMP  # always fixed, overrides anything else
+        int_ann_df = master_merged[(master_merged["_kind"] == "int_ann") & (master_merged["_reached"])].copy()
+        if not int_ann_df.empty:
+            int_ann_df["Designated_Temp"] = INT_ANN_FIXED_TEMP  # always fixed, overrides anything else
+
+        final_no_temp_df = master_merged[
+            (master_merged["_kind"] == "final_ann") & (master_merged["_reached"])
+        ].copy()
+    else:
+        int_ann_df = master_merged.copy()
+        final_no_temp_df = master_merged.copy()
+
+    if not int_ann_from_ann_df.empty:
+        already = set(int_ann_df["_coil_key"]) if not int_ann_df.empty else set()
+        extra = int_ann_from_ann_df[~int_ann_from_ann_df["_coil_key"].isin(already)]
+        int_ann_df = pd.concat([int_ann_df, extra], ignore_index=True) if not extra.empty else int_ann_df
+
+    # --- Fallback: coils not found in master OR ann at all, but the Daily
+    # Report itself already computed a Next Destination + Target Final TH
+    # (validated when the report was generated) - trust that directly. ---
+    covered_keys = set(ann_df["_coil_key"]) | set(master_df["_coil_key"])
+    if "_daily_next" in l2_df.columns:
+        fallback = l2_df[~l2_df["_coil_key"].isin(covered_keys)].copy()
+        fallback = fallback[fallback["_daily_next"].notna()]
+        if not fallback.empty:
+            def daily_kind(v):
+                v = str(v).lower()
+                if "int" in v and "ann" in v:
+                    return "int_ann"
+                if "f.ann" in v or "f ann" in v or "final ann" in v:
+                    return "final_ann"
+                return None
+
+            fallback["_kind"] = fallback["_daily_next"].apply(daily_kind)
+            fallback["Targeted_Th_mm_master"] = fallback["_daily_target_mm"]
+            fallback["Customer"] = fallback["_customer"]
+            fallback["Temper"] = fallback["_temper"]
+            fallback["Width"] = fallback["_width"]
+            fallback["Alloy"] = fallback["_alloy"]
+            fallback["Next"] = fallback["_daily_next"]
+            fallback["_flag_diff"] = fallback.apply(
+                lambda r: pd.notna(r.get("Targeted_Th_mm_master")) and round(r["Exit_mm"], 2) != round(r["Targeted_Th_mm_master"], 2),
+                axis=1,
+            )
+
+            fallback_int = fallback[fallback["_kind"] == "int_ann"].copy()
+            if not fallback_int.empty:
+                fallback_int["Designated_Temp"] = INT_ANN_FIXED_TEMP
+                int_ann_df = pd.concat([int_ann_df, fallback_int], ignore_index=True)
+
+            fallback_final = fallback[fallback["_kind"] == "final_ann"].copy()
+            if not fallback_final.empty:
+                final_no_temp_df = pd.concat([final_no_temp_df, fallback_final], ignore_index=True)
 
     ann_coil_keys = set(ann_df["_coil_key"])
-    final_no_temp_df = master_merged[
-        (master_merged["_kind"] == "final_ann")
-        & (master_merged["_reached"])
-        & (~master_merged["_coil_key"].isin(ann_coil_keys))
-    ].copy()
+    if not final_no_temp_df.empty:
+        final_no_temp_df = final_no_temp_df[~final_no_temp_df["_coil_key"].isin(ann_coil_keys)].copy()
 
     return int_ann_df, final_with_temp_df, final_no_temp_df
 
